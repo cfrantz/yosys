@@ -83,6 +83,9 @@ struct SynthPass : public ScriptPass
 		log("        do not run 'alumacc' pass. i.e. keep arithmetic operators in\n");
 		log("        their direct form ($add, $sub, etc.).\n");
 		log("\n");
+		log("    -carry <none|ha>\n");
+		log("        carry mapping style (none, half-adders, ...) default=none\n");
+		log("\n");
 		log("    -noregfile\n");
 		log("        do not map register files\n");
 		log("\n");
@@ -119,7 +122,7 @@ struct SynthPass : public ScriptPass
 		log("\n");
 	}
 
-	string top_module, json_file, blif_file, plib, fsm_opts, memory_opts;
+	string top_module, json_file, blif_file, plib, fsm_opts, memory_opts, carry_mode;
 	std::vector<string> extra_plib, extra_map;
 
 	bool autotop, forvpr, noalumacc, nofsm, noshare, noregfile, iopad, complexdff, flatten;
@@ -137,6 +140,7 @@ struct SynthPass : public ScriptPass
 		noshare = false;
 		iopad = false;
 		complexdff = false;
+		carry_mode = "none";
 		flatten = true;
 		json_file = "";
 		blif_file = "";
@@ -229,6 +233,12 @@ struct SynthPass : public ScriptPass
 				complexdff = true;
 				continue;
 			}
+			if (args[argidx] == "-carry") {
+				carry_mode = args[++argidx];
+				if (carry_mode != "none" && carry_mode != "ha")
+					log_cmd_error("Unsupported carry style: %s\n", carry_mode.c_str());
+				continue;
+			}
 			if (args[argidx] == "-noflatten") {
 				flatten = false;
 				continue;
@@ -310,7 +320,7 @@ struct SynthPass : public ScriptPass
 			run("opt_clean");
 		}
 
-		if (check_label("map_ram")) {
+		if (check_label("map_ram", "(unless -noregfile)")) {
 			// RegFile extraction
 			if (!noregfile) {
 				run("memory_libmap -lib +/fabulous/ram_regfile.txt");
@@ -326,12 +336,13 @@ struct SynthPass : public ScriptPass
 
 		if (check_label("map_gates")) {
 			run("opt -full");
-			run("techmap -map +/techmap.v");
+			run(stringf("techmap -map +/techmap.v -map +/fabulous/arith_map.v -D ARITH_%s",
+				help_mode ? "<carry>" : carry_mode.c_str()));
 			run("opt -fast");
 		}
 
 		if (check_label("map_iopad", "(if -iopad)")) {
-			if (iopad) {
+			if (iopad || help_mode) {
 				run("opt -full");
 				run("iopadmap -bits -outpad $__FABULOUS_OBUF I:PAD -inpad $__FABULOUS_IBUF O:PAD "
 					"-toutpad IO_1_bidirectional_frame_config_pass ~T:I:PAD "

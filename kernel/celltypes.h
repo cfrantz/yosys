@@ -101,6 +101,14 @@ struct CellTypes
 		setup_type(ID($specify2), {ID::EN, ID::SRC, ID::DST}, pool<RTLIL::IdString>(), true);
 		setup_type(ID($specify3), {ID::EN, ID::SRC, ID::DST, ID::DAT}, pool<RTLIL::IdString>(), true);
 		setup_type(ID($specrule), {ID::EN_SRC, ID::EN_DST, ID::SRC, ID::DST}, pool<RTLIL::IdString>(), true);
+		setup_type(ID($print), {ID::EN, ID::ARGS, ID::TRG}, pool<RTLIL::IdString>());
+		setup_type(ID($check), {ID::A, ID::EN, ID::ARGS, ID::TRG}, pool<RTLIL::IdString>());
+		setup_type(ID($set_tag), {ID::A, ID::SET, ID::CLR}, {ID::Y});
+		setup_type(ID($get_tag), {ID::A}, {ID::Y});
+		setup_type(ID($overwrite_tag), {ID::A, ID::SET, ID::CLR}, pool<RTLIL::IdString>());
+		setup_type(ID($original_tag), {ID::A}, {ID::Y});
+		setup_type(ID($future_ff), {ID::A}, {ID::Y});
+		setup_type(ID($scopeinfo), {}, {});
 	}
 
 	void setup_internals_eval()
@@ -116,7 +124,8 @@ struct CellTypes
 			ID($shl), ID($shr), ID($sshl), ID($sshr), ID($shift), ID($shiftx),
 			ID($lt), ID($le), ID($eq), ID($ne), ID($eqx), ID($nex), ID($ge), ID($gt),
 			ID($add), ID($sub), ID($mul), ID($div), ID($mod), ID($divfloor), ID($modfloor), ID($pow),
-			ID($logic_and), ID($logic_or), ID($concat), ID($macc)
+			ID($logic_and), ID($logic_or), ID($concat), ID($macc),
+			ID($bweqx)
 		};
 
 		for (auto type : unary_ops)
@@ -125,7 +134,7 @@ struct CellTypes
 		for (auto type : binary_ops)
 			setup_type(type, {ID::A, ID::B}, {ID::Y}, true);
 
-		for (auto type : std::vector<RTLIL::IdString>({ID($mux), ID($pmux)}))
+		for (auto type : std::vector<RTLIL::IdString>({ID($mux), ID($pmux), ID($bwmux)}))
 			setup_type(type, {ID::A, ID::B, ID::S}, {ID::Y}, true);
 
 		for (auto type : std::vector<RTLIL::IdString>({ID($bmux), ID($demux)}))
@@ -430,6 +439,11 @@ struct CellTypes
 			return const_demux(arg1, arg2);
 		}
 
+		if (cell->type == ID($bweqx))
+		{
+			return const_bweqx(arg1, arg2);
+		}
+
 		if (cell->type == ID($lut))
 		{
 			int width = cell->parameters.at(ID::WIDTH).as_int();
@@ -490,6 +504,8 @@ struct CellTypes
 	{
 		if (cell->type.in(ID($mux), ID($_MUX_)))
 			return const_mux(arg1, arg2, arg3);
+		if (cell->type == ID($bwmux))
+			return const_bwmux(arg1, arg2, arg3);
 		if (cell->type == ID($pmux))
 			return const_pmux(arg1, arg2, arg3);
 		if (cell->type == ID($_AOI3_))

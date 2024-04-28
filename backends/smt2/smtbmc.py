@@ -17,7 +17,7 @@
 # OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 #
 
-import os, sys, getopt, re, bisect
+import os, sys, getopt, re, bisect, json
 ##yosys-sys-path##
 from smtio import SmtIo, SmtOpts, MkVcd
 from ywio import ReadWitness, WriteWitness, WitnessValues
@@ -56,11 +56,17 @@ binarymode = False
 keep_going = False
 check_witness = False
 detect_loops = False
+incremental = None
+track_assumes = False
+minimize_assumes = False
 so = SmtOpts()
 
 
-def usage():
+def help():
     print(os.path.basename(sys.argv[0]) + """ [options] <yosys_smt2_output>
+
+    -h, --help
+    	show this message
 
     -t <num_steps>
     -t <skip_steps>:<num_steps>
@@ -171,6 +177,8 @@ def usage():
         further failed assertions. To output multiple traces
         covering all found failed assertions, the character '%' is
         replaced in all dump filenames with an increasing number.
+        In cover mode, don't stop when a cover trace contains a failed
+        assertion.
 
     --check-witness
         check that the used witness file contains sufficient
@@ -180,20 +188,39 @@ def usage():
         check if states are unique in temporal induction counter examples
         (this feature is experimental and incomplete)
 
+    --incremental
+        run in incremental mode (experimental)
+
+    --track-assumes
+        track individual assumptions and report a subset of used
+        assumptions that are sufficient for the reported outcome. This
+        can be used to debug PREUNSAT failures as well as to find a
+        smaller set of sufficient assumptions.
+
+    --minimize-assumes
+        when using --track-assumes, solve for a minimal set of sufficient assumptions.
+
 """ + so.helpmsg())
+
+def usage():
+    help()
     sys.exit(1)
 
 
 try:
-    opts, args = getopt.getopt(sys.argv[1:], so.shortopts + "t:igcm:", so.longopts +
-            ["final-only", "assume-skipped=", "smtc=", "cex=", "aig=", "aig-noheader", "yw=", "btorwit=", "presat",
+    opts, args = getopt.getopt(sys.argv[1:], so.shortopts + "t:higcm:", so.longopts +
+            ["help", "final-only", "assume-skipped=", "smtc=", "cex=", "aig=", "aig-noheader", "yw=", "btorwit=", "presat",
              "dump-vcd=", "dump-yw=", "dump-vlogtb=", "vlogtb-top=", "dump-smtc=", "dump-all", "noinfo", "append=",
-             "smtc-init", "smtc-top=", "noinit", "binary", "keep-going", "check-witness", "detect-loops"])
+             "smtc-init", "smtc-top=", "noinit", "binary", "keep-going", "check-witness", "detect-loops", "incremental",
+             "track-assumes", "minimize-assumes"])
 except:
     usage()
 
 for o, a in opts:
-    if o == "-t":
+    if o in ("-h", "--help"):
+        help()
+        sys.exit(0)
+    elif o == "-t":
         got_topt = True
         a = a.split(":")
         if len(a) == 1:
@@ -271,6 +298,13 @@ for o, a in opts:
         check_witness = True
     elif o == "--detect-loops":
         detect_loops = True
+    elif o == "--incremental":
+        from smtbmc_incremental import Incremental
+        incremental = Incremental()
+    elif o == "--track-assumes":
+        track_assumes = True
+    elif o == "--minimize-assumes":
+        minimize_assumes = True
     elif so.handle(o, a):
         pass
     else:
@@ -279,7 +313,7 @@ for o, a in opts:
 if len(args) != 1:
     usage()
 
-if sum([tempind, gentrace, covermode]) > 1:
+if sum([tempind, gentrace, covermode, incremental is not None]) > 1:
     usage()
 
 constr_final_start = None
@@ -429,12 +463,17 @@ def get_constr_expr(db, state, final=False, getvalues=False, individual=False):
 
 smt = SmtIo(opts=so)
 
+if track_assumes:
+    smt.smt2_options[':produce-unsat-assumptions'] = 'true'
+
 if noinfo and vcdfile is None and vlogtbfile is None and outconstr is None:
     smt.produce_models = False
 
 def print_msg(msg):
-    print("%s %s" % (smt.timestamp(), msg))
-    sys.stdout.flush()
+    if incremental:
+        incremental.print_msg(msg)
+    else:
+        print("%s %s" % (smt.timestamp(), msg), flush=True)
 
 print_msg("Solver: %s" % (so.solver))
 
@@ -629,15 +668,20 @@ if aimfile is not None:
                 num_steps = max(num_steps, step+2)
             step += 1
 
-if inywfile is not None:
-    if not got_topt:
-        skip_steps = 0
-        num_steps = 0
+ywfile_hierwitness_cache = None
+
+def ywfile_constraints(inywfile, constr_assumes, map_steps=None, skip_x=False):
+    global ywfile_hierwitness_cache
+    if map_steps is None:
+        map_steps = {}
 
     with open(inywfile, "r") as f:
         inyw = ReadWitness(f)
 
-        inits, seqs, clocks, mems = smt.hierwitness(topmod, allregs=True, blackbox=True)
+        if ywfile_hierwitness_cache is None:
+            ywfile_hierwitness_cache = smt.hierwitness(topmod, allregs=True, blackbox=True)
+
+        inits, seqs, clocks, mems = ywfile_hierwitness_cache
 
         smt_wires = defaultdict(list)
         smt_mems = defaultdict(list)
@@ -651,10 +695,14 @@ if inywfile is not None:
         addr_re = re.compile(r'\\\[[0-9]+\]$')
         bits_re = re.compile(r'[01?]*$')
 
+        max_t = -1
+
         for t, step in inyw.steps():
             present_signals, missing = step.present_signals(inyw.sigmap)
             for sig in present_signals:
                 bits = step[sig]
+                if skip_x:
+                    bits = bits.replace('x', '?')
                 if not bits_re.match(bits):
                     raise ValueError("unsupported bit value in Yosys witness file")
 
@@ -673,7 +721,7 @@ if inywfile is not None:
                         if common_end <= common_offset:
                             continue
 
-                        smt_expr = smt.witness_net_expr(topmod, f"s{t}", wire)
+                        smt_expr = smt.witness_net_expr(topmod, f"s{map_steps.get(t, t)}", wire)
 
                         if not smt_bool:
                             slice_high = common_end - offset - 1
@@ -703,7 +751,7 @@ if inywfile is not None:
                         for mem in smt_mems[sig.memory_path]:
                             width, size, bv = mem["width"], mem["size"], mem["statebv"]
 
-                            smt_expr = smt.net_expr(topmod, f"s{t}", mem["smtpath"])
+                            smt_expr = smt.net_expr(topmod, f"s{map_steps.get(t, t)}", mem["smtpath"])
 
                             if bv:
                                 word_low = sig.memory_addr * width
@@ -727,11 +775,21 @@ if inywfile is not None:
 
                             smt_constr = "(= %s #b%s)" % (smt_expr, bit_slice)
                             constr_assumes[t].append((inywfile, smt_constr))
+            max_t = t
 
-            if not got_topt:
-                if not check_witness:
-                    skip_steps = max(skip_steps, t)
-                num_steps = max(num_steps, t+1)
+        return max_t
+
+if inywfile is not None:
+    if not got_topt:
+        skip_steps = 0
+        num_steps = 0
+
+    max_t = ywfile_constraints(inywfile, constr_assumes)
+
+    if not got_topt:
+        if not check_witness:
+            skip_steps = max(skip_steps, max_t)
+        num_steps = max(num_steps, max_t+1)
 
 if btorwitfile is not None:
     with open(btorwitfile, "r") as f:
@@ -830,7 +888,7 @@ if btorwitfile is not None:
         skip_steps = step
         num_steps = step+1
 
-def collect_mem_trace_data(steps_start, steps_stop, vcd=None):
+def collect_mem_trace_data(steps, vcd=None):
     mem_trace_data = dict()
 
     for mempath in sorted(smt.hiermems(topmod)):
@@ -838,16 +896,16 @@ def collect_mem_trace_data(steps_start, steps_stop, vcd=None):
 
         expr_id = list()
         expr_list = list()
-        for i in range(steps_start, steps_stop):
+        for seq, i in enumerate(steps):
             for j in range(rports):
-                expr_id.append(('R', i-steps_start, j, 'A'))
-                expr_id.append(('R', i-steps_start, j, 'D'))
+                expr_id.append(('R', seq, j, 'A'))
+                expr_id.append(('R', seq, j, 'D'))
                 expr_list.append(smt.mem_expr(topmod, "s%d" % i, mempath, "R%dA" % j))
                 expr_list.append(smt.mem_expr(topmod, "s%d" % i, mempath, "R%dD" % j))
             for j in range(wports):
-                expr_id.append(('W', i-steps_start, j, 'A'))
-                expr_id.append(('W', i-steps_start, j, 'D'))
-                expr_id.append(('W', i-steps_start, j, 'M'))
+                expr_id.append(('W', seq, j, 'A'))
+                expr_id.append(('W', seq, j, 'D'))
+                expr_id.append(('W', seq, j, 'M'))
                 expr_list.append(smt.mem_expr(topmod, "s%d" % i, mempath, "W%dA" % j))
                 expr_list.append(smt.mem_expr(topmod, "s%d" % i, mempath, "W%dD" % j))
                 expr_list.append(smt.mem_expr(topmod, "s%d" % i, mempath, "W%dM" % j))
@@ -932,14 +990,14 @@ def collect_mem_trace_data(steps_start, steps_stop, vcd=None):
                 netpath[-1] += "<%0*x>" % ((len(addr)+3) // 4, int_addr)
                 vcd.add_net([topmod] + netpath, width)
 
-            for i in range(steps_start, steps_stop):
+            for seq, i in enumerate(steps):
                 if i not in mem_trace_data:
                     mem_trace_data[i] = list()
-                mem_trace_data[i].append((netpath, int_addr, "".join(tdata[i-steps_start])))
+                mem_trace_data[i].append((netpath, int_addr, "".join(tdata[seq])))
 
     return mem_trace_data
 
-def write_vcd_trace(steps_start, steps_stop, index):
+def write_vcd_trace(steps, index, seq_time=False):
     filename = vcdfile.replace("%", index)
     print_msg("Writing trace to VCD file: %s" % (filename))
 
@@ -960,10 +1018,10 @@ def write_vcd_trace(steps_start, steps_stop, index):
                     vcd.add_clock([topmod] + netpath, edge)
                 path_list.append(netpath)
 
-        mem_trace_data = collect_mem_trace_data(steps_start, steps_stop, vcd)
+        mem_trace_data = collect_mem_trace_data(steps, vcd)
 
-        for i in range(steps_start, steps_stop):
-            vcd.set_time(i)
+        for seq, i in enumerate(steps):
+            vcd.set_time(seq if seq_time else i)
             value_list = smt.get_net_bin_list(topmod, path_list, "s%d" % i)
             for path, value in zip(path_list, value_list):
                 vcd.set_net([topmod] + path, value)
@@ -971,7 +1029,14 @@ def write_vcd_trace(steps_start, steps_stop, index):
                 for path, addr, value in mem_trace_data[i]:
                     vcd.set_net([topmod] + path, value)
 
-        vcd.set_time(steps_stop)
+        if seq_time:
+            end_time = len(steps)
+        elif steps:
+            end_time = steps[-1] + 1
+        else:
+            end_time = 0
+
+        vcd.set_time(end_time)
 
 def detect_state_loop(steps_start, steps_stop):
     print_msg(f"Checking for loops in found induction counter example")
@@ -1016,7 +1081,7 @@ def escape_identifier(identifier):
 
 
 
-def write_vlogtb_trace(steps_start, steps_stop, index):
+def write_vlogtb_trace(steps, index):
     filename = vlogtbfile.replace("%", index)
     print_msg("Writing trace to Verilog testbench: %s" % (filename))
 
@@ -1081,7 +1146,7 @@ def write_vlogtb_trace(steps_start, steps_stop, index):
         print("  initial begin", file=f)
 
         regs = sorted(smt.hiernets(vlogtb_topmod, regs_only=True))
-        regvals = smt.get_net_bin_list(vlogtb_topmod, regs, vlogtb_state.replace("@@step_idx@@", str(steps_start)))
+        regvals = smt.get_net_bin_list(vlogtb_topmod, regs, vlogtb_state.replace("@@step_idx@@", str(steps[0])))
 
         print("`ifndef VERILATOR", file=f)
         print("    #1;", file=f)
@@ -1096,7 +1161,7 @@ def write_vlogtb_trace(steps_start, steps_stop, index):
         anyconsts = sorted(smt.hieranyconsts(vlogtb_topmod))
         for info in anyconsts:
             if info[3] is not None:
-                modstate = smt.net_expr(vlogtb_topmod, vlogtb_state.replace("@@step_idx@@", str(steps_start)), info[0])
+                modstate = smt.net_expr(vlogtb_topmod, vlogtb_state.replace("@@step_idx@@", str(steps[0])), info[0])
                 value = smt.bv2bin(smt.get("(|%s| %s)" % (info[1], modstate)))
                 print("    UUT.%s = %d'b%s;" % (".".join(escape_identifier(info[0] + [info[3]])), len(value), value), file=f);
 
@@ -1106,7 +1171,7 @@ def write_vlogtb_trace(steps_start, steps_stop, index):
 
             addr_expr_list = list()
             data_expr_list = list()
-            for i in range(steps_start, steps_stop):
+            for i in steps:
                 for j in range(rports):
                     addr_expr_list.append(smt.mem_expr(vlogtb_topmod, vlogtb_state.replace("@@step_idx@@", str(i)), mempath, "R%dA" % j))
                     data_expr_list.append(smt.mem_expr(vlogtb_topmod, vlogtb_state.replace("@@step_idx@@", str(i)), mempath, "R%dD" % j))
@@ -1127,7 +1192,7 @@ def write_vlogtb_trace(steps_start, steps_stop, index):
         print("", file=f)
         anyseqs = sorted(smt.hieranyseqs(vlogtb_topmod))
 
-        for i in range(steps_start, steps_stop):
+        for i in steps:
             pi_names = [[name] for name, _ in primary_inputs if name not in clock_inputs]
             pi_values = smt.get_net_bin_list(vlogtb_topmod, pi_names, vlogtb_state.replace("@@step_idx@@", str(i)))
 
@@ -1159,14 +1224,14 @@ def write_vlogtb_trace(steps_start, steps_stop, index):
                 print("  end", file=f)
                 print("  always @(posedge clock) begin", file=f)
 
-        print("    genclock <= cycle < %d;" % (steps_stop-1), file=f)
+        print("    genclock <= cycle < %d;" % (steps[-1]), file=f)
         print("    cycle <= cycle + 1;", file=f)
         print("  end", file=f)
 
         print("endmodule", file=f)
 
 
-def write_constr_trace(steps_start, steps_stop, index):
+def write_constr_trace(steps, index):
     filename = outconstr.replace("%", index)
     print_msg("Writing trace to constraints file: %s" % (filename))
 
@@ -1183,7 +1248,7 @@ def write_constr_trace(steps_start, steps_stop, index):
             constr_prefix = smtctop[1] + "."
 
     if smtcinit:
-        steps_start = steps_stop - 1
+        steps = [steps[-1]]
 
     with open(filename, "w") as f:
         primary_inputs = list()
@@ -1192,13 +1257,13 @@ def write_constr_trace(steps_start, steps_stop, index):
             width = smt.modinfo[constr_topmod].wsize[name]
             primary_inputs.append((name, width))
 
-        if steps_start == 0 or smtcinit:
+        if steps[0] == 0 or smtcinit:
             print("initial", file=f)
         else:
-            print("state %d" % steps_start, file=f)
+            print("state %d" % steps[0], file=f)
 
         regnames = sorted(smt.hiernets(constr_topmod, regs_only=True))
-        regvals = smt.get_net_list(constr_topmod, regnames, constr_state.replace("@@step_idx@@", str(steps_start)))
+        regvals = smt.get_net_list(constr_topmod, regnames, constr_state.replace("@@step_idx@@", str(steps[0])))
 
         for name, val in zip(regnames, regvals):
             print("assume (= [%s%s] %s)" % (constr_prefix, ".".join(name), val), file=f)
@@ -1209,7 +1274,7 @@ def write_constr_trace(steps_start, steps_stop, index):
 
             addr_expr_list = list()
             data_expr_list = list()
-            for i in range(steps_start, steps_stop):
+            for i in steps:
                 for j in range(rports):
                     addr_expr_list.append(smt.mem_expr(constr_topmod, constr_state.replace("@@step_idx@@", str(i)), mempath, "R%dA" % j))
                     data_expr_list.append(smt.mem_expr(constr_topmod, constr_state.replace("@@step_idx@@", str(i)), mempath, "R%dD" % j))
@@ -1225,7 +1290,7 @@ def write_constr_trace(steps_start, steps_stop, index):
             for addr, data in addr_data.items():
                 print("assume (= (select [%s%s] %s) %s)" % (constr_prefix, ".".join(mempath), addr, data), file=f)
 
-        for k in range(steps_start, steps_stop):
+        for k in steps:
             if not smtcinit:
                 print("", file=f)
                 print("state %d" % k, file=f)
@@ -1236,11 +1301,14 @@ def write_constr_trace(steps_start, steps_stop, index):
             for name, val in zip(pi_names, pi_values):
                 print("assume (= [%s%s] %s)" % (constr_prefix, ".".join(name), val), file=f)
 
-def write_yw_trace(steps_start, steps_stop, index, allregs=False):
-    filename = outywfile.replace("%", index)
-    print_msg("Writing trace to Yosys witness file: %s" % (filename))
+def write_yw_trace(steps, index, allregs=False, filename=None):
+    if filename is None:
+        if outywfile is None:
+            return
+        filename = outywfile.replace("%", index)
+        print_msg("Writing trace to Yosys witness file: %s" % (filename))
 
-    mem_trace_data = collect_mem_trace_data(steps_start, steps_stop)
+    mem_trace_data = collect_mem_trace_data(steps)
 
     with open(filename, "w") as f:
         inits, seqs, clocks, mems = smt.hierwitness(topmod, allregs)
@@ -1284,18 +1352,28 @@ def write_yw_trace(steps_start, steps_stop, index, allregs=False):
                 sig = yw.add_sig(word_path, overlap_start, overlap_end - overlap_start, True)
                 mem_init_values.append((sig, overlap_bits.replace("x", "?")))
 
-        for k in range(steps_start, steps_stop):
+        exprs = []
+        all_sigs = []
+
+        for i, k in enumerate(steps):
             step_values = WitnessValues()
 
-            if k == steps_start:
+            if not i:
                 for sig, value in mem_init_values:
                     step_values[sig] = value
                 sigs = inits + seqs
             else:
                 sigs = seqs
 
+            exprs.extend(smt.witness_net_expr(topmod, f"s{k}", sig) for sig in sigs)
+
+            all_sigs.append(sigs)
+
+        bvs = iter(smt.get_list(exprs))
+
+        for sigs in all_sigs:
             for sig in sigs:
-                value = smt.bv2bin(smt.get(smt.witness_net_expr(topmod, f"s{k}", sig)))
+                value = smt.bv2bin(next(bvs))
                 step_values[sig["sig"]] = value
             yw.step(step_values)
 
@@ -1303,17 +1381,24 @@ def write_yw_trace(steps_start, steps_stop, index, allregs=False):
 
 
 def write_trace(steps_start, steps_stop, index, allregs=False):
+    if steps_stop is None:
+        steps = steps_start
+        seq_time = True
+    else:
+        steps = list(range(steps_start, steps_stop))
+        seq_time = False
+
     if vcdfile is not None:
-        write_vcd_trace(steps_start, steps_stop, index)
+        write_vcd_trace(steps, index, seq_time=seq_time)
 
     if vlogtbfile is not None:
-        write_vlogtb_trace(steps_start, steps_stop, index)
+        write_vlogtb_trace(steps, index)
 
     if outconstr is not None:
-        write_constr_trace(steps_start, steps_stop, index)
+        write_constr_trace(steps, index)
 
     if outywfile is not None:
-        write_yw_trace(steps_start, steps_stop, index, allregs)
+        write_yw_trace(steps, index, allregs)
 
 
 def print_failed_asserts_worker(mod, state, path, extrainfo, infomap, infokey=()):
@@ -1431,6 +1516,44 @@ def get_active_assert_map(step, active):
 
     return assert_map
 
+assume_enables = {}
+
+def declare_assume_enables():
+    def recurse(mod, path, key_base=()):
+        for expr, desc in smt.modinfo[mod].assumes.items():
+            enable = f"|assume_enable {len(assume_enables)}|"
+            smt.smt2_assumptions[(expr, key_base)] = enable
+            smt.write(f"(declare-const {enable} Bool)")
+            assume_enables[(expr, key_base)] = (enable, path, desc)
+
+        for cell, submod in smt.modinfo[mod].cells.items():
+            recurse(submod, f"{path}.{cell}", (mod, cell, key_base))
+
+    recurse(topmod, topmod)
+
+if track_assumes:
+    declare_assume_enables()
+
+def smt_assert_design_assumes(step):
+    if not track_assumes:
+        smt_assert_consequent("(|%s_u| s%d)" % (topmod, step))
+        return
+
+    if not assume_enables:
+        return
+
+    def expr_for_assume(assume_key, base=None):
+        expr, key_base = assume_key
+        expr_prefix = f"(|{expr}| "
+        expr_suffix = ")"
+        while key_base:
+            mod, cell, key_base = key_base
+            expr_prefix += f"(|{mod}_h {cell}| "
+            expr_suffix += ")"
+        return f"{expr_prefix} s{step}{expr_suffix}"
+
+    for assume_key, (enable, path, desc) in assume_enables.items():
+        smt_assert_consequent(f"(=> {enable} {expr_for_assume(assume_key)})")
 
 states = list()
 asserts_antecedent_cache = [list()]
@@ -1585,7 +1708,18 @@ def smt_check_sat(expected=["sat", "unsat"]):
         smt_forall_assert()
     return smt.check_sat(expected=expected)
 
-if tempind:
+def report_tracked_assumptions(msg):
+    if track_assumes:
+        print_msg(msg)
+        for key in smt.get_unsat_assumptions(minimize=minimize_assumes):
+            enable, path, descr = assume_enables[key]
+            print_msg(f"  In {path}: {descr}")
+
+
+if incremental:
+    incremental.mainloop()
+
+elif tempind:
     retstatus = "FAILED"
     skip_counter = step_size
     for step in range(num_steps, -1, -1):
@@ -1594,7 +1728,7 @@ if tempind:
             break
 
         smt_state(step)
-        smt_assert_consequent("(|%s_u| s%d)" % (topmod, step))
+        smt_assert_design_assumes(step)
         smt_assert_antecedent("(|%s_h| s%d)" % (topmod, step))
         smt_assert_antecedent("(not (|%s_is| s%d))" % (topmod, step))
         smt_assert_consequent(get_constr_expr(constr_assumes, step))
@@ -1637,6 +1771,7 @@ if tempind:
 
         else:
             print_msg("Temporal induction successful.")
+            report_tracked_assumptions("Used assumptions:")
             retstatus = "PASSED"
             break
 
@@ -1662,7 +1797,7 @@ elif covermode:
 
     while step < num_steps:
         smt_state(step)
-        smt_assert_consequent("(|%s_u| s%d)" % (topmod, step))
+        smt_assert_design_assumes(step)
         smt_assert_antecedent("(|%s_h| s%d)" % (topmod, step))
         smt_assert_consequent(get_constr_expr(constr_assumes, step))
 
@@ -1683,6 +1818,7 @@ elif covermode:
             smt_assert("(distinct (covers_%d s%d) #b%s)" % (coveridx, step, "0" * len(cover_desc)))
 
             if smt_check_sat() == "unsat":
+                report_tracked_assumptions("Used assumptions:")
                 smt_pop()
                 break
 
@@ -1691,13 +1827,14 @@ elif covermode:
                     print_msg("Appending additional step %d." % i)
                     smt_state(i)
                     smt_assert_antecedent("(not (|%s_is| s%d))" % (topmod, i))
-                    smt_assert_consequent("(|%s_u| s%d)" % (topmod, i))
+                    smt_assert_design_assumes(i)
                     smt_assert_antecedent("(|%s_h| s%d)" % (topmod, i))
                     smt_assert_antecedent("(|%s_t| s%d s%d)" % (topmod, i-1, i))
                     smt_assert_consequent(get_constr_expr(constr_assumes, i))
                 print_msg("Re-solving with appended steps..")
                 if smt_check_sat() == "unsat":
                     print("%s Cannot appended steps without violating assumptions!" % smt.timestamp())
+                    report_tracked_assumptions("Conflicting assumptions:")
                     found_failed_assert = True
                     retstatus = "FAILED"
                     break
@@ -1730,7 +1867,7 @@ elif covermode:
             smt_pop()
             smt.write("(define-fun covers_%d ((state |%s_s|)) (_ BitVec %d) (bvand (covers_%d state) #b%s))" % (coveridx, topmod, len(cover_desc), coveridx-1, cover_mask))
 
-        if found_failed_assert:
+        if found_failed_assert and not keep_going:
             break
 
         if "1" not in cover_mask:
@@ -1753,7 +1890,7 @@ else:  # not tempind, covermode
     retstatus = "PASSED"
     while step < num_steps:
         smt_state(step)
-        smt_assert_consequent("(|%s_u| s%d)" % (topmod, step))
+        smt_assert_design_assumes(step)
         smt_assert_antecedent("(|%s_h| s%d)" % (topmod, step))
         smt_assert_consequent(get_constr_expr(constr_assumes, step))
 
@@ -1783,7 +1920,7 @@ else:  # not tempind, covermode
             if step+i < num_steps:
                 smt_state(step+i)
                 smt_assert_antecedent("(not (|%s_is| s%d))" % (topmod, step+i))
-                smt_assert_consequent("(|%s_u| s%d)" % (topmod, step+i))
+                smt_assert_design_assumes(step + i)
                 smt_assert_antecedent("(|%s_h| s%d)" % (topmod, step+i))
                 smt_assert_antecedent("(|%s_t| s%d s%d)" % (topmod, step+i-1, step+i))
                 smt_assert_consequent(get_constr_expr(constr_assumes, step+i))
@@ -1797,7 +1934,8 @@ else:  # not tempind, covermode
                     print_msg("Checking assumptions in steps %d to %d.." % (step, last_check_step))
 
                 if smt_check_sat() == "unsat":
-                    print("%s Assumptions are unsatisfiable!" % smt.timestamp())
+                    print_msg("Assumptions are unsatisfiable!")
+                    report_tracked_assumptions("Conficting assumptions:")
                     retstatus = "PREUNSAT"
                     break
 
@@ -1850,13 +1988,14 @@ else:  # not tempind, covermode
                                 print_msg("Appending additional step %d." % i)
                                 smt_state(i)
                                 smt_assert_antecedent("(not (|%s_is| s%d))" % (topmod, i))
-                                smt_assert_consequent("(|%s_u| s%d)" % (topmod, i))
+                                smt_assert_design_assumes(i)
                                 smt_assert_antecedent("(|%s_h| s%d)" % (topmod, i))
                                 smt_assert_antecedent("(|%s_t| s%d s%d)" % (topmod, i-1, i))
                                 smt_assert_consequent(get_constr_expr(constr_assumes, i))
                             print_msg("Re-solving with appended steps..")
                             if smt_check_sat() == "unsat":
-                                print("%s Cannot append steps without violating assumptions!" % smt.timestamp())
+                                print_msg("Cannot append steps without violating assumptions!")
+                                report_tracked_assumptions("Conflicting assumptions:")
                                 retstatus = "FAILED"
                                 break
                         print_anyconsts(step)
@@ -1943,5 +2082,6 @@ else:  # not tempind, covermode
 smt.write("(exit)")
 smt.wait()
 
-print_msg("Status: %s" % retstatus)
-sys.exit(0 if retstatus == "PASSED" else 1)
+if not incremental:
+    print_msg("Status: %s" % retstatus)
+    sys.exit(0 if retstatus == "PASSED" else 1)

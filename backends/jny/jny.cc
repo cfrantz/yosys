@@ -21,7 +21,6 @@
 #include "kernel/register.h"
 #include "kernel/sigtools.h"
 #include "kernel/celltypes.h"
-#include "kernel/cellaigs.h"
 #include "kernel/log.h"
 #include <string>
 #include <algorithm>
@@ -125,7 +124,7 @@ struct JnyWriter
         design->sort();
 
         f << "{\n";
-        f << "  \"$schema\": \"https://raw.githubusercontent.com/YosysHQ/yosys/master/misc/jny.schema.json\",\n";
+        f << "  \"$schema\": \"https://raw.githubusercontent.com/YosysHQ/yosys/main/misc/jny.schema.json\",\n";
         f << stringf("  \"generator\": \"%s\",\n", escape_string(yosys_version_str).c_str());
         f << "  \"version\": \"0.0.1\",\n";
         f << "  \"invocation\": \"" << escape_string(invk) << "\",\n";
@@ -427,7 +426,7 @@ struct JnyBackend : public Backend {
         log("        Don't include property information in the netlist output.\n");
         log("\n");
         log("The JSON schema for JNY output files is located in the \"jny.schema.json\" file\n");
-        log("which is located at \"https://raw.githubusercontent.com/YosysHQ/yosys/master/misc/jny.schema.json\"\n");
+        log("which is located at \"https://raw.githubusercontent.com/YosysHQ/yosys/main/misc/jny.schema.json\"\n");
         log("\n");
     }
 
@@ -546,8 +545,9 @@ struct JnyPass : public Pass {
 
         std::ostream *f;
         std::stringstream buf;
+        bool empty = filename.empty();
 
-        if (!filename.empty()) {
+        if (!empty) {
             rewrite_filename(filename);
             std::ofstream *ff = new std::ofstream;
             ff->open(filename.c_str(), std::ofstream::trunc);
@@ -565,7 +565,7 @@ struct JnyPass : public Pass {
         JnyWriter jny_writer(*f, false, connections, attributes, properties);
         jny_writer.write_metadata(design, 0, invk.str());
 
-        if (!filename.empty()) {
+        if (!empty) {
             delete f;
         } else {
             log("%s", buf.str().c_str());

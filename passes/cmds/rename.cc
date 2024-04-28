@@ -116,6 +116,8 @@ static bool rename_witness(RTLIL::Design *design, dict<RTLIL::Module *, int> &ca
 	}
 	cache.emplace(module, -1);
 
+	std::vector<std::pair<Cell *, IdString>> renames;
+
 	bool has_witness_signals = false;
 	for (auto cell : module->cells())
 	{
@@ -130,13 +132,18 @@ static bool rename_witness(RTLIL::Design *design, dict<RTLIL::Module *, int> &ca
 						c = '_';
 				auto new_id = module->uniquify("\\_witness_." + name);
 				cell->set_hdlname_attribute({ "_witness_", strstr(new_id.c_str(), ".") + 1 });
-				module->rename(cell, new_id);
+				renames.emplace_back(cell, new_id);
 			}
 		}
 
 		if (cell->type.in(ID($anyconst), ID($anyseq), ID($anyinit), ID($allconst), ID($allseq))) {
 			has_witness_signals = true;
-			auto QY = cell->type == ID($anyinit) ? ID::Q : ID::Y;
+			IdString QY;
+			bool clk2fflogic = false;
+			if (cell->type == ID($anyinit))
+				QY = (clk2fflogic = cell->get_bool_attribute(ID(clk2fflogic))) ? ID::D : ID::Q;
+			else
+				QY = ID::Y;
 			auto sig_out = cell->getPort(QY);
 
 			for (auto chunk : sig_out.chunks()) {
@@ -148,12 +155,32 @@ static bool rename_witness(RTLIL::Design *design, dict<RTLIL::Module *, int> &ca
 					auto new_id = module->uniquify("\\_witness_." + name);
 					auto new_wire = module->addWire(new_id, GetSize(sig_out));
 					new_wire->set_hdlname_attribute({ "_witness_", strstr(new_id.c_str(), ".") + 1 });
-					module->connect({sig_out, new_wire});
+					if (clk2fflogic)
+						module->connect({new_wire, sig_out});
+					else
+						module->connect({sig_out, new_wire});
 					cell->setPort(QY, new_wire);
 					break;
 				}
 			}
 		}
+
+
+		if (cell->type.in(ID($assert), ID($assume), ID($cover), ID($live), ID($fair), ID($check))) {
+			has_witness_signals = true;
+			if (cell->name.isPublic())
+				continue;
+			std::string name = stringf("%s_%s", cell->type.c_str() + 1, cell->name.c_str() + 1);
+			for (auto &c : name)
+				if ((c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (c < '0' || c > '9') && c != '_')
+					c = '_';
+			auto new_id = module->uniquify("\\_witness_." + name);
+			renames.emplace_back(cell, new_id);
+			cell->set_hdlname_attribute({ "_witness_", strstr(new_id.c_str(), ".") + 1 });
+		}
+	}
+	for (auto rename : renames) {
+		module->rename(rename.first, rename.second);
 	}
 
 	cache[module] = has_witness_signals;

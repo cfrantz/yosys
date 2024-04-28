@@ -17,10 +17,11 @@
  *
  */
 
-#include "kernel/yosys.h"
-
 #ifndef RTLIL_H
 #define RTLIL_H
+
+#include "kernel/yosys_common.h"
+#include "kernel/yosys.h"
 
 YOSYS_NAMESPACE_BEGIN
 
@@ -85,10 +86,10 @@ namespace RTLIL
 
 		// the global id string cache
 
+		static bool destruct_guard_ok; // POD, will be initialized to zero
 		static struct destruct_guard_t {
-			bool ok; // POD, will be initialized to zero
-			destruct_guard_t() { ok = true; }
-			~destruct_guard_t() { ok = false; }
+			destruct_guard_t() { destruct_guard_ok = true; }
+			~destruct_guard_t() { destruct_guard_ok = false; }
 		} destruct_guard;
 
 		static std::vector<char*> global_id_storage_;
@@ -147,7 +148,7 @@ namespace RTLIL
 
 		static int get_reference(const char *p)
 		{
-			log_assert(destruct_guard.ok);
+			log_assert(destruct_guard_ok);
 
 			if (!p[0])
 				return 0;
@@ -225,7 +226,7 @@ namespace RTLIL
 		{
 			// put_reference() may be called from destructors after the destructor of
 			// global_refcount_storage_ has been run. in this case we simply do nothing.
-			if (!destruct_guard.ok || !idx)
+			if (!destruct_guard_ok || !idx)
 				return;
 
 		#ifdef YOSYS_XTRACE_GET_PUT
@@ -308,10 +309,14 @@ namespace RTLIL
 		bool operator!=(const char *rhs) const { return strcmp(c_str(), rhs) != 0; }
 
 		char operator[](size_t i) const {
-			const char *p = c_str();
+                        const char *p = c_str();
+#ifndef NDEBUG
 			for (; i != 0; i--, p++)
 				log_assert(*p != 0);
 			return *p;
+#else
+			return *(p + i);
+#endif
 		}
 
 		std::string substr(size_t pos = 0, size_t len = std::string::npos) const {
@@ -443,13 +448,13 @@ namespace RTLIL
 	static inline std::string encode_filename(const std::string &filename)
 	{
 		std::stringstream val;
-		if (!std::any_of(filename.begin(), filename.end(), [](char c) { 
-			return static_cast<unsigned char>(c) < 33 || static_cast<unsigned char>(c) > 126; 
+		if (!std::any_of(filename.begin(), filename.end(), [](char c) {
+			return static_cast<unsigned char>(c) < 33 || static_cast<unsigned char>(c) > 126;
 		})) return filename;
 		for (unsigned char const c : filename) {
 			if (c < 33 || c > 126)
 				val << stringf("$%02x", c);
-			else 
+			else
 				val << c;
 		}
 		return val.str();
@@ -504,6 +509,9 @@ namespace RTLIL
 	RTLIL::Const const_pmux        (const RTLIL::Const &arg1, const RTLIL::Const &arg2, const RTLIL::Const &arg3);
 	RTLIL::Const const_bmux        (const RTLIL::Const &arg1, const RTLIL::Const &arg2);
 	RTLIL::Const const_demux       (const RTLIL::Const &arg1, const RTLIL::Const &arg2);
+
+	RTLIL::Const const_bweqx       (const RTLIL::Const &arg1, const RTLIL::Const &arg2);
+	RTLIL::Const const_bwmux       (const RTLIL::Const &arg1, const RTLIL::Const &arg2, const RTLIL::Const &arg3);
 
 
 	// This iterator-range-pair is used for Design::modules(), Module::wires() and Module::cells().
@@ -683,6 +691,7 @@ struct RTLIL::Const
 	bool is_fully_ones() const;
 	bool is_fully_def() const;
 	bool is_fully_undef() const;
+	bool is_fully_undef_x_only() const;
 	bool is_onehot(int *pos = nullptr) const;
 
 	inline RTLIL::Const extract(int offset, int len = 1, RTLIL::State padding = RTLIL::State::S0) const {
@@ -704,7 +713,7 @@ struct RTLIL::Const
 	inline unsigned int hash() const {
 		unsigned int h = mkhash_init;
 		for (auto b : bits)
-			mkhash(h, b);
+			h = mkhash(h, b);
 		return h;
 	}
 };
@@ -795,8 +804,14 @@ struct RTLIL::SigBit
 	unsigned int hash() const;
 };
 
-struct RTLIL::SigSpecIterator : public std::iterator<std::input_iterator_tag, RTLIL::SigSpec>
+struct RTLIL::SigSpecIterator
 {
+	typedef std::input_iterator_tag iterator_category;
+	typedef RTLIL::SigBit value_type;
+	typedef ptrdiff_t difference_type;
+	typedef RTLIL::SigBit* pointer;
+	typedef RTLIL::SigBit& reference;
+
 	RTLIL::SigSpec *sig_p;
 	int index;
 
@@ -806,8 +821,14 @@ struct RTLIL::SigSpecIterator : public std::iterator<std::input_iterator_tag, RT
 	inline void operator++() { index++; }
 };
 
-struct RTLIL::SigSpecConstIterator : public std::iterator<std::input_iterator_tag, RTLIL::SigSpec>
+struct RTLIL::SigSpecConstIterator
 {
+	typedef std::input_iterator_tag iterator_category;
+	typedef RTLIL::SigBit value_type;
+	typedef ptrdiff_t difference_type;
+	typedef RTLIL::SigBit* pointer;
+	typedef RTLIL::SigBit& reference;
+
 	const RTLIL::SigSpec *sig_p;
 	int index;
 
@@ -904,6 +925,7 @@ public:
 	void remove(const pool<RTLIL::SigBit> &pattern, RTLIL::SigSpec *other) const;
 	void remove2(const pool<RTLIL::SigBit> &pattern, RTLIL::SigSpec *other);
 	void remove2(const std::set<RTLIL::SigBit> &pattern, RTLIL::SigSpec *other);
+	void remove2(const pool<RTLIL::Wire*> &pattern, RTLIL::SigSpec *other);
 
 	void remove(int offset, int length = 1);
 	void remove_const();
@@ -912,6 +934,9 @@ public:
 	RTLIL::SigSpec extract(const pool<RTLIL::SigBit> &pattern, const RTLIL::SigSpec *other = NULL) const;
 	RTLIL::SigSpec extract(int offset, int length = 1) const;
 	RTLIL::SigSpec extract_end(int offset) const { return extract(offset, width_ - offset); }
+
+	RTLIL::SigBit lsb() const { log_assert(width_); return (*this)[0]; };
+	RTLIL::SigBit msb() const { log_assert(width_); return (*this)[width_ - 1]; };
 
 	void append(const RTLIL::SigSpec &signal);
 	inline void append(Wire *wire) { append(RTLIL::SigSpec(wire)); }
@@ -1294,6 +1319,8 @@ public:
 	RTLIL::Cell* addModFloor (RTLIL::IdString name, const RTLIL::SigSpec &sig_a, const RTLIL::SigSpec &sig_b, const RTLIL::SigSpec &sig_y, bool is_signed = false, const std::string &src = "");
 	RTLIL::Cell* addPow (RTLIL::IdString name, const RTLIL::SigSpec &sig_a, const RTLIL::SigSpec &sig_b, const RTLIL::SigSpec &sig_y, bool a_signed = false, bool b_signed = false, const std::string &src = "");
 
+	RTLIL::Cell* addFa (RTLIL::IdString name, const RTLIL::SigSpec &sig_a, const RTLIL::SigSpec &sig_b, const RTLIL::SigSpec &sig_c, const RTLIL::SigSpec &sig_x, const RTLIL::SigSpec &sig_y, const std::string &src = "");
+
 	RTLIL::Cell* addLogicNot (RTLIL::IdString name, const RTLIL::SigSpec &sig_a, const RTLIL::SigSpec &sig_y, bool is_signed = false, const std::string &src = "");
 	RTLIL::Cell* addLogicAnd (RTLIL::IdString name, const RTLIL::SigSpec &sig_a, const RTLIL::SigSpec &sig_b, const RTLIL::SigSpec &sig_y, bool is_signed = false, const std::string &src = "");
 	RTLIL::Cell* addLogicOr  (RTLIL::IdString name, const RTLIL::SigSpec &sig_a, const RTLIL::SigSpec &sig_b, const RTLIL::SigSpec &sig_y, bool is_signed = false, const std::string &src = "");
@@ -1302,6 +1329,9 @@ public:
 	RTLIL::Cell* addPmux (RTLIL::IdString name, const RTLIL::SigSpec &sig_a, const RTLIL::SigSpec &sig_b, const RTLIL::SigSpec &sig_s, const RTLIL::SigSpec &sig_y, const std::string &src = "");
 	RTLIL::Cell* addBmux (RTLIL::IdString name, const RTLIL::SigSpec &sig_a, const RTLIL::SigSpec &sig_s, const RTLIL::SigSpec &sig_y, const std::string &src = "");
 	RTLIL::Cell* addDemux (RTLIL::IdString name, const RTLIL::SigSpec &sig_a, const RTLIL::SigSpec &sig_s, const RTLIL::SigSpec &sig_y, const std::string &src = "");
+
+	RTLIL::Cell* addBweqx  (RTLIL::IdString name, const RTLIL::SigSpec &sig_a, const RTLIL::SigSpec &sig_b, const RTLIL::SigSpec &sig_y, const std::string &src = "");
+	RTLIL::Cell* addBwmux  (RTLIL::IdString name, const RTLIL::SigSpec &sig_a, const RTLIL::SigSpec &sig_b, const RTLIL::SigSpec &sig_s, const RTLIL::SigSpec &sig_y, const std::string &src = "");
 
 	RTLIL::Cell* addSlice  (RTLIL::IdString name, const RTLIL::SigSpec &sig_a, const RTLIL::SigSpec &sig_y, RTLIL::Const offset, const std::string &src = "");
 	RTLIL::Cell* addConcat (RTLIL::IdString name, const RTLIL::SigSpec &sig_a, const RTLIL::SigSpec &sig_b, const RTLIL::SigSpec &sig_y, const std::string &src = "");
@@ -1432,6 +1462,9 @@ public:
 	RTLIL::SigSpec Bmux     (RTLIL::IdString name, const RTLIL::SigSpec &sig_a, const RTLIL::SigSpec &sig_s, const std::string &src = "");
 	RTLIL::SigSpec Demux     (RTLIL::IdString name, const RTLIL::SigSpec &sig_a, const RTLIL::SigSpec &sig_s, const std::string &src = "");
 
+	RTLIL::SigSpec Bweqx      (RTLIL::IdString name, const RTLIL::SigSpec &sig_a, const RTLIL::SigSpec &sig_b, const std::string &src = "");
+	RTLIL::SigSpec Bwmux      (RTLIL::IdString name, const RTLIL::SigSpec &sig_a, const RTLIL::SigSpec &sig_b, const RTLIL::SigSpec &sig_s, const std::string &src = "");
+
 	RTLIL::SigBit BufGate    (RTLIL::IdString name, const RTLIL::SigBit &sig_a, const std::string &src = "");
 	RTLIL::SigBit NotGate    (RTLIL::IdString name, const RTLIL::SigBit &sig_a, const std::string &src = "");
 	RTLIL::SigBit AndGate    (RTLIL::IdString name, const RTLIL::SigBit &sig_a, const RTLIL::SigBit &sig_b, const std::string &src = "");
@@ -1454,6 +1487,13 @@ public:
 	RTLIL::SigSpec Allconst  (RTLIL::IdString name, int width = 1, const std::string &src = "");
 	RTLIL::SigSpec Allseq    (RTLIL::IdString name, int width = 1, const std::string &src = "");
 	RTLIL::SigSpec Initstate (RTLIL::IdString name, const std::string &src = "");
+
+	RTLIL::SigSpec SetTag          (RTLIL::IdString name, const std::string &tag, const RTLIL::SigSpec &sig_a, const RTLIL::SigSpec &sig_s, const RTLIL::SigSpec &sig_c, const std::string &src = "");
+	RTLIL::Cell*   addSetTag       (RTLIL::IdString name, const std::string &tag, const RTLIL::SigSpec &sig_a, const RTLIL::SigSpec &sig_s, const RTLIL::SigSpec &sig_c, const RTLIL::SigSpec &sig_y, const std::string &src = "");
+	RTLIL::SigSpec GetTag          (RTLIL::IdString name, const std::string &tag, const RTLIL::SigSpec &sig_a, const std::string &src = "");
+	RTLIL::Cell*   addOverwriteTag (RTLIL::IdString name, const std::string &tag, const RTLIL::SigSpec &sig_a, const RTLIL::SigSpec &sig_s, const RTLIL::SigSpec &sig_c, const std::string &src = "");
+	RTLIL::SigSpec OriginalTag     (RTLIL::IdString name, const std::string &tag, const RTLIL::SigSpec &sig_a, const std::string &src = "");
+	RTLIL::SigSpec FutureFF        (RTLIL::IdString name, const RTLIL::SigSpec &sig_e, const std::string &src = "");
 
 #ifdef WITH_PYTHON
 	static std::map<unsigned int, RTLIL::Module*> *get_all_modules(void);

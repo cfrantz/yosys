@@ -192,6 +192,10 @@ struct JsonWriter
 		for (auto c : module->cells()) {
 			if (use_selection && !module->selected(c))
 				continue;
+			// Eventually we will want to emit $scopeinfo, but currently this
+			// will break JSON netlist consumers like nextpnr
+			if (c->type == ID($scopeinfo))
+				continue;
 			f << stringf("%s\n", first ? "" : ",");
 			f << stringf("        %s: {\n", get_name(c->name).c_str());
 			f << stringf("          \"hide_name\": %s,\n", c->name[0] == '$' ? "1" : "0");
@@ -666,8 +670,9 @@ struct JsonPass : public Pass {
 
 		std::ostream *f;
 		std::stringstream buf;
+		bool empty = filename.empty();
 
-		if (!filename.empty()) {
+		if (!empty) {
 			rewrite_filename(filename);
 			std::ofstream *ff = new std::ofstream;
 			ff->open(filename.c_str(), std::ofstream::trunc);
@@ -683,7 +688,7 @@ struct JsonPass : public Pass {
 		JsonWriter json_writer(*f, true, aig_mode, compat_int_mode);
 		json_writer.write_design(design);
 
-		if (!filename.empty()) {
+		if (!empty) {
 			delete f;
 		} else {
 			log("%s", buf.str().c_str());

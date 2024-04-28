@@ -79,6 +79,20 @@ def except_hook(exctype, value, traceback):
 sys.excepthook = except_hook
 
 
+def recursion_helper(iteration, *request):
+    stack = [iteration(*request)]
+
+    while stack:
+        top = stack.pop()
+        try:
+            request = next(top)
+        except StopIteration:
+            continue
+
+        stack.append(top)
+        stack.append(iteration(*request))
+
+
 hex_dict = {
     "0": "0000", "1": "0001", "2": "0010", "3": "0011",
     "4": "0100", "5": "0101", "6": "0110", "7": "0111",
@@ -100,6 +114,7 @@ class SmtModInfo:
         self.clocks = dict()
         self.cells = dict()
         self.asserts = dict()
+        self.assumes = dict()
         self.covers = dict()
         self.maximize = set()
         self.minimize = set()
@@ -127,6 +142,7 @@ class SmtIo:
         self.recheck = False
         self.smt2cache = [list()]
         self.smt2_options = dict()
+        self.smt2_assumptions = dict()
         self.p = None
         self.p_index = solvers_index
         solvers_index += 1
@@ -245,6 +261,7 @@ class SmtIo:
             self.logic_uf = False
             self.unroll_idcnt = 0
             self.unroll_buffer = ""
+            self.unroll_level = 0
             self.unroll_sorts = set()
             self.unroll_objs = set()
             self.unroll_decls = dict()
@@ -297,10 +314,22 @@ class SmtIo:
         return stmt
 
     def unroll_stmt(self, stmt):
-        if not isinstance(stmt, list):
-            return stmt
+        result = []
+        recursion_helper(self._unroll_stmt_into, stmt, result)
+        return result.pop()
 
-        stmt = [self.unroll_stmt(s) for s in stmt]
+    def _unroll_stmt_into(self, stmt, output, depth=128):
+        if not isinstance(stmt, list):
+            output.append(stmt)
+            return
+
+        new_stmt = []
+        for s in stmt:
+            if depth:
+                yield from self._unroll_stmt_into(s, new_stmt, depth - 1)
+            else:
+                yield s, new_stmt
+        stmt = new_stmt
 
         if len(stmt) >= 2 and not isinstance(stmt[0], list) and stmt[0] in self.unroll_decls:
             assert stmt[1] in self.unroll_objs
@@ -329,12 +358,19 @@ class SmtIo:
                     decl[2] = list()
 
                 if len(decl) > 0:
-                    decl = self.unroll_stmt(decl)
+                    tmp = []
+                    if depth:
+                        yield from self._unroll_stmt_into(decl, tmp, depth - 1)
+                    else:
+                        yield decl, tmp
+
+                    decl = tmp.pop()
                     self.write(self.unparse(decl), unroll=False)
 
-            return self.unroll_cache[key]
+            output.append(self.unroll_cache[key])
+            return
 
-        return stmt
+        output.append(stmt)
 
     def p_thread_main(self):
         while True:
@@ -420,13 +456,15 @@ class SmtIo:
                     self.p_close()
 
         if unroll and self.unroll:
-            stmt = self.unroll_buffer + stmt
-            self.unroll_buffer = ""
-
             s = re.sub(r"\|[^|]*\|", "", stmt)
-            if s.count("(") != s.count(")"):
-                self.unroll_buffer = stmt + " "
+            self.unroll_level += s.count("(") - s.count(")")
+            if self.unroll_level > 0:
+                self.unroll_buffer += stmt
+                self.unroll_buffer += " "
                 return
+            else:
+                stmt = self.unroll_buffer + stmt
+                self.unroll_buffer = ""
 
             s = self.parse(stmt)
 
@@ -565,6 +603,12 @@ class SmtIo:
                 self.modinfo[self.curmod].covers["%s_c %s" % (self.curmod, fields[2])] = f'{fields[4]} ({fields[3]})'
             else:
                 self.modinfo[self.curmod].covers["%s_c %s" % (self.curmod, fields[2])] = fields[3]
+
+        if fields[1] == "yosys-smt2-assume":
+            if len(fields) > 4:
+                self.modinfo[self.curmod].assumes["%s_u %s" % (self.curmod, fields[2])] = f'{fields[4]} ({fields[3]})'
+            else:
+                self.modinfo[self.curmod].assumes["%s_u %s" % (self.curmod, fields[2])] = fields[3]
 
         if fields[1] == "yosys-smt2-maximize":
             self.modinfo[self.curmod].maximize.add(fields[2])
@@ -749,8 +793,13 @@ class SmtIo:
         return stmt
 
     def check_sat(self, expected=["sat", "unsat", "unknown", "timeout", "interrupted"]):
+        if self.smt2_assumptions:
+            assume_exprs = " ".join(self.smt2_assumptions.values())
+            check_stmt = f"(check-sat-assuming ({assume_exprs}))"
+        else:
+            check_stmt = "(check-sat)"
         if self.debug_print:
-            print("> (check-sat)")
+            print(f"> {check_stmt}")
         if self.debug_file and not self.nocomments:
             print("; running check-sat..", file=self.debug_file)
             self.debug_file.flush()
@@ -764,11 +813,11 @@ class SmtIo:
                     for cache_stmt in cache_ctx:
                         self.p_write(cache_stmt + "\n", False)
 
-            self.p_write("(check-sat)\n", True)
+            self.p_write(f"{check_stmt}\n", True)
 
             if self.timeinfo:
                 i = 0
-                s = "/-\|"
+                s = r"/-\|"
 
                 count = 0
                 num_bs = 0
@@ -832,7 +881,7 @@ class SmtIo:
 
         if self.debug_file:
             print("(set-info :status %s)" % result, file=self.debug_file)
-            print("(check-sat)", file=self.debug_file)
+            print(check_stmt, file=self.debug_file)
             self.debug_file.flush()
 
         if result not in expected:
@@ -909,6 +958,48 @@ class SmtIo:
     def bv2int(self, v):
         return int(self.bv2bin(v), 2)
 
+    def get_raw_unsat_assumptions(self):
+        self.write("(get-unsat-assumptions)")
+        exprs = set(self.unparse(part) for part in self.parse(self.read()))
+        unsat_assumptions = []
+        for key, value in self.smt2_assumptions.items():
+            # normalize expression
+            value = self.unparse(self.parse(value))
+            if value in exprs:
+                exprs.remove(value)
+                unsat_assumptions.append(key)
+        return unsat_assumptions
+
+    def get_unsat_assumptions(self, minimize=False):
+        if not minimize:
+            return self.get_raw_unsat_assumptions()
+        required_assumptions = {}
+
+        while True:
+            candidate_assumptions = {}
+            for key in self.get_raw_unsat_assumptions():
+                if key not in required_assumptions:
+                    candidate_assumptions[key] = self.smt2_assumptions[key]
+
+            while candidate_assumptions:
+
+                candidate_key, candidate_assume = candidate_assumptions.popitem()
+
+                self.smt2_assumptions = {}
+                for key, assume in candidate_assumptions.items():
+                    self.smt2_assumptions[key] = assume
+                for key, assume in required_assumptions.items():
+                    self.smt2_assumptions[key] = assume
+                result = self.check_sat()
+
+                if result == 'unsat':
+                    candidate_assumptions = None
+                else:
+                    required_assumptions[candidate_key] = candidate_assume
+
+            if candidate_assumptions is not None:
+                return list(required_assumptions)
+
     def get(self, expr):
         self.write("(get-value (%s))" % (expr))
         return self.parse(self.read())[0][1]
@@ -917,7 +1008,7 @@ class SmtIo:
         if len(expr_list) == 0:
             return []
         self.write("(get-value (%s))" % " ".join(expr_list))
-        return [n[1] for n in self.parse(self.read())]
+        return [n[1] for n in self.parse(self.read()) if n]
 
     def get_path(self, mod, path):
         assert mod in self.modinfo
@@ -1171,7 +1262,7 @@ class MkVcd:
 
     def escape_name(self, name):
         name = re.sub(r"\[([0-9a-zA-Z_]*[a-zA-Z_][0-9a-zA-Z_]*)\]", r"<\1>", name)
-        if re.match("[\[\]]", name) and name[0] != "\\":
+        if re.match(r"[\[\]]", name) and name[0] != "\\":
             name = "\\" + name
         return name
 
